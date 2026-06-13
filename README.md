@@ -6,8 +6,8 @@
 - [x] Implement SP as a baseline (across 2 GPUs)
   - [x] for attn
   - [x] for mlp
-- [ ] Implement TP+SP
-  - [ ] for attn
+- [x] Implement TP+SP
+  - [x] for attn
   - [ ] for mlp
 - [ ] Profile each run and validate memory consumption
 - [ ] Find claims in paper to validate

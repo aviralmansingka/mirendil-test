@@ -8,7 +8,7 @@ import torch.distributed as dist
 import torch.nn.functional as F
 
 from profiler_utils import profile_rank_region
-from sequence_parallelism import shard_seq_parallel
+from sequence_parallelism import all_gather_seq, shard_seq_parallel
 
 
 def setup_distributed() -> tuple[int, int, int, torch.device]:
@@ -16,15 +16,18 @@ def setup_distributed() -> tuple[int, int, int, torch.device]:
         raise RuntimeError("this script requires CUDA")
     if "LOCAL_RANK" not in os.environ:
         raise RuntimeError(
-            "launch with: torchrun --standalone --nproc_per_node=2 tp.py"
+            "launch with: torchrun --standalone --nproc_per_node=8 ts.py"
         )
 
-    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=60))
+    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=300))
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    if world_size != 2:
-        raise RuntimeError(f"expected world_size == 2, got {world_size}")
+    expected_world_size = os.environ.get("EXPECTED_WORLD_SIZE")
+    if expected_world_size is not None and world_size != int(expected_world_size):
+        raise RuntimeError(
+            f"expected world_size == {expected_world_size}, got {world_size}"
+        )
 
     LOCAL_RANK = int(os.environ["LOCAL_RANK"])
     if LOCAL_RANK >= torch.cuda.device_count():
@@ -107,14 +110,9 @@ def tsp_attn(X_p, W_q_p, W_k_p, W_v_p, W_o_p, num_heads):
         k_rp = project_to_heads(F.linear(X_p, W_k_r), local_heads, D).contiguous()
         v_rp = project_to_heads(F.linear(X_p, W_v_r), local_heads, D).contiguous()
 
-        gathered_k = [torch.empty_like(k_rp) for _ in range(world_size)]
-        gathered_v = [torch.empty_like(v_rp) for _ in range(world_size)]
-        dist.all_gather(gathered_k, k_rp)
-        dist.all_gather(gathered_v, v_rp)
-
         # k/v: [B, local_heads, S, D]
-        k_r = torch.cat(gathered_k, dim=2)
-        v_r = torch.cat(gathered_v, dim=2)
+        k_r = all_gather_seq(k_rp)
+        v_r = all_gather_seq(v_rp)
 
         q_positions = torch.arange(
             rank * local_seq,
@@ -226,10 +224,10 @@ def init_tensor(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
 
 
 def run_tsp_attn(device: torch.device, rank: int, world_size: int, should_print: bool):
-    B = 2
-    S = 8
-    H = 16
-    num_heads = 4
+    B = int(os.environ.get("BENCH_B", "1"))
+    S = int(os.environ.get("BENCH_S", "8192"))
+    H = int(os.environ.get("BENCH_H", "4096"))
+    num_heads = int(os.environ.get("BENCH_NUM_HEADS", "32"))
     if H % num_heads != 0:
         raise ValueError("hidden_size must be divisible by num_heads")
 
@@ -259,7 +257,6 @@ def run_tsp_attn(device: torch.device, rank: int, world_size: int, should_print:
 
     X_p = shard_seq_parallel(X, rank, world_size)
 
-    p_heads = num_heads // world_size
     # W_q_p/W_k_p/W_v_local: [local_hidden, H]
     W_q_p = shard_col_parallel(W_q, rank, world_size, num_heads)
     W_k_p = shard_col_parallel(W_k, rank, world_size, num_heads)

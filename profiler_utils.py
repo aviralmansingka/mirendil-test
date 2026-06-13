@@ -25,6 +25,8 @@ def profile_rank_region(
 
     torch.cuda.synchronize(device)
     torch.cuda.reset_peak_memory_stats(device)
+    start_event = torch.cuda.Event(enable_timing=True)
+    end_event = torch.cuda.Event(enable_timing=True)
 
     with profile(
         activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA],
@@ -33,9 +35,12 @@ def profile_rank_region(
         with_stack=True,
     ) as prof:
         with record_function(f"{label}_rank_{rank}"):
+            start_event.record()
             yield
+            end_event.record()
         torch.cuda.synchronize(device)
 
+    elapsed_ms = start_event.elapsed_time(end_event)
     peak_allocated_gb = torch.cuda.max_memory_allocated(device) / 1024**3
     peak_reserved_gb = torch.cuda.max_memory_reserved(device) / 1024**3
 
@@ -45,11 +50,15 @@ def profile_rank_region(
     prof.export_memory_timeline(memory_path, device=f"cuda:{local_rank}")
 
     peak_allocated = torch.tensor(peak_allocated_gb, device=device)
+    max_elapsed_ms = torch.tensor(elapsed_ms, device=device)
     if dist.is_available() and dist.is_initialized():
         dist.all_reduce(peak_allocated, op=dist.ReduceOp.MAX)
+        dist.all_reduce(max_elapsed_ms, op=dist.ReduceOp.MAX)
 
     print(
         f"[rank {rank}] {label}: "
+        f"elapsed_ms={elapsed_ms:.3f}, "
+        f"max_rank_elapsed_ms={max_elapsed_ms.item():.3f}, "
         f"peak_allocated={peak_allocated_gb:.6f} GiB, "
         f"peak_reserved={peak_reserved_gb:.6f} GiB, "
         f"max_rank_peak_allocated={peak_allocated.item():.6f} GiB, "

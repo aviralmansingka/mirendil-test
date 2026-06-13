@@ -17,15 +17,18 @@ def setup_distributed() -> tuple[int, int, int, torch.device]:
         raise RuntimeError("this script requires CUDA")
     if "LOCAL_RANK" not in os.environ:
         raise RuntimeError(
-            "launch with: torchrun --standalone --nproc_per_node=2 tp.py"
+            "launch with: torchrun --standalone --nproc_per_node=8 sp.py"
         )
 
-    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=60))
+    dist.init_process_group(backend="nccl", timeout=timedelta(seconds=300))
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    if world_size != 2:
-        raise RuntimeError(f"expected world_size == 2, got {world_size}")
+    expected_world_size = os.environ.get("EXPECTED_WORLD_SIZE")
+    if expected_world_size is not None and world_size != int(expected_world_size):
+        raise RuntimeError(
+            f"expected world_size == {expected_world_size}, got {world_size}"
+        )
 
     LOCAL_RANK = int(os.environ["LOCAL_RANK"])
     if LOCAL_RANK >= torch.cuda.device_count():
@@ -78,6 +81,23 @@ def shard_seq_parallel(X: torch.Tensor, rank: int, world_size: int) -> torch.Ten
     start = rank * local_seq
     end = (rank + 1) * local_seq
     return X[:, start:end, :].contiguous()
+
+
+def all_gather_seq(x_p: torch.Tensor) -> torch.Tensor:
+    B, num_heads, local_seq, D = x_p.shape
+    world_size = dist.get_world_size()
+
+    x = torch.empty(
+        B,
+        num_heads,
+        local_seq * world_size,
+        D,
+        device=x_p.device,
+        dtype=x_p.dtype,
+    )
+    chunks = list(x.chunk(world_size, dim=2))
+    dist.all_gather(chunks, x_p)
+    return x
 
 
 def shard_row_parallel(
@@ -228,14 +248,9 @@ def sp_attn(
     k_p = project_to_heads(F.linear(X_p, W_k), num_heads, D).contiguous()
     v_p = project_to_heads(F.linear(X_p, W_v), num_heads, D).contiguous()
 
-    gathered_k = [torch.empty_like(k_p) for _ in range(world_size)]
-    gathered_v = [torch.empty_like(v_p) for _ in range(world_size)]
-    dist.all_gather(gathered_k, k_p)
-    dist.all_gather(gathered_v, v_p)
-
     # k/v: [B, num_heads, S, D]
-    k = torch.cat(gathered_k, dim=2)
-    v = torch.cat(gathered_v, dim=2)
+    k = all_gather_seq(k_p)
+    v = all_gather_seq(v_p)
 
     q_positions = torch.arange(
         rank * local_seq,
@@ -306,10 +321,10 @@ def manual_attn(
 def run_sp_attn(
     device: torch.device, rank: int, world_size: int, should_print: bool
 ) -> None:
-    B = 2
-    S = 8
-    H = 16
-    num_heads = 4
+    B = int(os.environ.get("BENCH_B", "1"))
+    S = int(os.environ.get("BENCH_S", "8192"))
+    H = int(os.environ.get("BENCH_H", "4096"))
+    num_heads = int(os.environ.get("BENCH_NUM_HEADS", "32"))
     if H % num_heads != 0:
         raise ValueError("hidden_size must be divisible by num_heads")
     assert_sp_config(S, world_size)

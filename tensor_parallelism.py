@@ -16,15 +16,18 @@ def setup_distributed() -> tuple[int, int, int, torch.device]:
         raise RuntimeError("this script requires CUDA")
     if "LOCAL_RANK" not in os.environ:
         raise RuntimeError(
-            "launch with: torchrun --standalone --nproc_per_node=2 tp.py"
+            "launch with: torchrun --standalone --nproc_per_node=8 tp.py"
         )
 
     dist.init_process_group(backend="nccl")
 
     rank = dist.get_rank()
     world_size = dist.get_world_size()
-    if world_size != 2:
-        raise RuntimeError(f"expected world_size == 2, got {world_size}")
+    expected_world_size = os.environ.get("EXPECTED_WORLD_SIZE")
+    if expected_world_size is not None and world_size != int(expected_world_size):
+        raise RuntimeError(
+            f"expected world_size == {expected_world_size}, got {world_size}"
+        )
 
     LOCAL_RANK = int(os.environ["LOCAL_RANK"])
     if LOCAL_RANK >= torch.cuda.device_count():
@@ -300,10 +303,10 @@ def manual_attn(
 def run_tp_attn(
     device: torch.device, rank: int, world_size: int, should_print: bool
 ) -> None:
-    B = 2
-    S = 8
-    H = 16
-    num_heads = 4
+    B = int(os.environ.get("BENCH_B", "1"))
+    S = int(os.environ.get("BENCH_S", "8192"))
+    H = int(os.environ.get("BENCH_H", "4096"))
+    num_heads = int(os.environ.get("BENCH_NUM_HEADS", "32"))
     assert_tp_config(H, num_heads, world_size)
 
     if rank == 0:

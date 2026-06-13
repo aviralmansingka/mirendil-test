@@ -9,6 +9,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from profiler_utils import profile_rank_region
+
 
 def setup_distributed() -> tuple[int, int, int, torch.device]:
     if not torch.cuda.is_available():
@@ -341,14 +343,15 @@ def run_sp_attn(
 
     with torch.no_grad():
         expected = attn(X, W_q, W_k, W_v, W_o, num_heads)
-        out = sp_attn(
-            X_p,
-            W_q,
-            W_k,
-            W_v,
-            W_o,
-            num_heads,
-        )
+        with profile_rank_region("sp_attention", device):
+            out = sp_attn(
+                X_p,
+                W_q,
+                W_k,
+                W_v,
+                W_o,
+                num_heads,
+            )
 
     expected_p = shard_seq_parallel(expected, rank, world_size)
     torch.testing.assert_close(out, expected_p, rtol=1e-5, atol=1e-5)

@@ -8,6 +8,8 @@ import torch
 import torch.distributed as dist
 import torch.nn.functional as F
 
+from profiler_utils import profile_rank_region
+
 
 def setup_distributed() -> tuple[int, int, int, torch.device]:
     if not torch.cuda.is_available():
@@ -184,7 +186,7 @@ def assert_shapes(
     p_heads: int,
 ) -> int:
     p_hidden = W_q_p.shape[0]
-    if W_k_p.shape != W_q_p.shape or W_v_local.shape != W_q_local.shape:
+    if W_k_p.shape != W_q_p.shape or W_v_p.shape != W_q_p.shape:
         raise ValueError("p Q, K, and V weights must have matching shapes")
     if W_o_p.shape != (H, p_hidden):
         raise ValueError(
@@ -205,7 +207,7 @@ def assert_mlp_shapes(
         raise ValueError(f"expected W_in_p input size {H}, got {H_in}")
     if W_out_p.shape != (H, p_I):
         raise ValueError(
-            f"expected W_out_p shape {(H, p_I)}, got {tuple(W_out_local.shape)}"
+            f"expected W_out_p shape {(H, p_I)}, got {tuple(W_out_p.shape)}"
         )
     return p_I
 
@@ -242,7 +244,7 @@ def tp_attn(
         is_causal=True,
     )
     # attn_p: [B, p_heads, S, D]
-    attn_p = attn_p.transpose(1, 2).contiguous().view(B, S, local_hidden)
+    attn_p = attn_p.transpose(1, 2).contiguous().view(B, S, p_hidden)
 
     out = F.linear(attn_p, W_o_p)
     dist.all_reduce(out, op=dist.ReduceOp.SUM)
@@ -339,14 +341,15 @@ def run_tp_attn(
 
     with torch.no_grad():
         expected = attn(X, W_q, W_k, W_v, W_o, num_heads)
-        out = tp_attn(
-            X,
-            W_q_p,
-            W_k_p,
-            W_v_p,
-            W_o_p,
-            p_heads,
-        )
+        with profile_rank_region("tp_attention", device):
+            out = tp_attn(
+                X,
+                W_q_p,
+                W_k_p,
+                W_v_p,
+                W_o_p,
+                p_heads,
+            )
 
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
 

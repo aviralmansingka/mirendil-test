@@ -1,3 +1,4 @@
+from dataclasses import dataclass
 import modal
 
 app = modal.App("tp-attn")
@@ -5,8 +6,8 @@ trace_volume = modal.Volume.from_name("tp-attn-traces", create_if_missing=True)
 TRACE_ROOT = "/traces"
 GPU_CONFIG = "h100:8"
 NPROC_PER_NODE = 8
-BENCH_B = 1
-BENCH_S = 8192
+BENCH_B = 8
+BENCH_S = 65536
 BENCH_H = 4096
 BENCH_NUM_HEADS = 32
 
@@ -20,12 +21,19 @@ image = (
     .add_local_file("profiler_utils.py", remote_path="/root/profiler_utils.py")
     .add_local_file("tensor_parallelism.py", remote_path="/root/tp.py")
     .add_local_file("sequence_parallelism.py", remote_path="/root/sp.py")
-    .add_local_file("sequence_parallelism.py", remote_path="/root/sequence_parallelism.py")
-    .add_local_file("ts_parallelism.py", remote_path="/root/ts.py")
+    .add_local_file("ts_parallelism.py", remote_path="/root/tsp.py")
 )
 
 
-def _run_torchrun(script_path: str, trace_name: str) -> list[str]:
+@dataclass
+class Input:
+    batch_size: int
+    seq_len: int
+    hidden_size: int
+    num_heads: int
+
+
+def _run_torchrun(script_path: str, trace_name: str, input: Input) -> list[str]:
     import os
     import subprocess
 
@@ -40,10 +48,10 @@ def _run_torchrun(script_path: str, trace_name: str) -> list[str]:
         "NCCL_NVLS_ENABLE": "0",
         "TRACE_DIR": trace_dir,
         "EXPECTED_WORLD_SIZE": str(NPROC_PER_NODE),
-        "BENCH_B": str(BENCH_B),
-        "BENCH_S": str(BENCH_S),
-        "BENCH_H": str(BENCH_H),
-        "BENCH_NUM_HEADS": str(BENCH_NUM_HEADS),
+        "BENCH_B": str(input.batch_size),
+        "BENCH_S": str(input.seq_len),
+        "BENCH_H": str(input.hidden_size),
+        "BENCH_NUM_HEADS": str(input.num_heads),
     }
     subprocess.run(
         [
@@ -64,25 +72,35 @@ def _run_torchrun(script_path: str, trace_name: str) -> list[str]:
     )
 
 
-@app.function(gpu=GPU_CONFIG, image=image, volumes={TRACE_ROOT: trace_volume})
-def tp() -> list[str]:
-    return _run_torchrun("/root/tp.py", "tp")
-
-
-@app.function(gpu=GPU_CONFIG, image=image, volumes={TRACE_ROOT: trace_volume})
-def sp() -> list[str]:
-    return _run_torchrun("/root/sp.py", "sp")
-
-
-@app.function(gpu=GPU_CONFIG, image=image, volumes={TRACE_ROOT: trace_volume})
-def ts() -> list[str]:
-    return _run_torchrun("/root/ts.py", "tsp")
-
-
-@app.local_entrypoint()
-def main():
-    for name, fn in (("tp", tp), ("sp", sp), ("tsp", ts)):
-        files = fn.remote()
-        print(f"{name} traces written to Modal Volume tp-attn-traces:")
-        for file in files:
-            print(f"  {file}")
+@app.function(
+    gpu=GPU_CONFIG,
+    image=image,
+    volumes={TRACE_ROOT: trace_volume},
+    timeout=30 * 60,
+)
+def run() -> list[str]:
+    inputs = [
+        Input(batch_size=8, seq_len=8192, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=16384, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=32768, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=65536, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=8192, hidden_size=2048, num_heads=32),
+        Input(batch_size=8, seq_len=16384, hidden_size=2048, num_heads=32),
+        Input(batch_size=8, seq_len=32768, hidden_size=2048, num_heads=32),
+        Input(batch_size=8, seq_len=65536, hidden_size=2048, num_heads=32),
+        Input(batch_size=8, seq_len=2 * 65536, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=2 * 65536, hidden_size=2048, num_heads=32),
+        Input(batch_size=8, seq_len=4 * 65536, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=4 * 65536, hidden_size=2048, num_heads=32),
+        Input(batch_size=8, seq_len=8 * 65536, hidden_size=2048, num_heads=16),
+        Input(batch_size=8, seq_len=8 * 65536, hidden_size=2048, num_heads=32),
+    ]
+    for input in inputs:
+        print("tp", input)
+        _run_torchrun("/root/tp.py", "tp", input)
+    for input in inputs:
+        print("sp", input)
+        _run_torchrun("/root/sp.py", "sp", input)
+    for input in inputs:
+        print("tsp", input)
+        _run_torchrun("/root/tsp.py", "tsp", input)

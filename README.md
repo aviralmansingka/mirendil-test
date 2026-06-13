@@ -8,7 +8,7 @@
   - [x] for mlp
 - [x] Implement TP+SP
   - [x] for attn
-  - [ ] for mlp
+  - [x] for mlp
 - [ ] Profile each run and validate memory consumption
 - [ ] Find claims in paper to validate
 - [ ] Prepare report

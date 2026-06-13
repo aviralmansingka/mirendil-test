@@ -76,6 +76,25 @@ def broadcast_W_qkvo_r(
     return W_q_r, W_k_r, W_v_r, W_o_r
 
 
+def broadcast_W_mlp_r(
+    W_in_p: torch.Tensor,
+    W_out_p: torch.Tensor,
+    owner_rank: int,
+) -> tuple[torch.Tensor, torch.Tensor]:
+    rank = dist.get_rank()
+
+    if rank == owner_rank:
+        W_in_r = W_in_p
+        W_out_r = W_out_p
+    else:
+        W_in_r = torch.empty_like(W_in_p)
+        W_out_r = torch.empty_like(W_out_p)
+
+    dist.broadcast(W_in_r, src=owner_rank)
+    dist.broadcast(W_out_r, src=owner_rank)
+    return W_in_r, W_out_r
+
+
 def tsp_attn(X_p, W_q_p, W_k_p, W_v_p, W_o_p, num_heads):
     """
     for r: 0...D
@@ -132,11 +151,49 @@ def tsp_attn(X_p, W_q_p, W_k_p, W_v_p, W_o_p, num_heads):
     return out
 
 
+def tsp_mlp(
+    X_p: torch.Tensor,
+    W_in_p: torch.Tensor,
+    W_out_p: torch.Tensor,
+) -> torch.Tensor:
+    _B, _local_seq, H = X_p.shape
+    assert_mlp_shapes(H, W_in_p, W_out_p)
+
+    world_size = dist.get_world_size()
+    out = torch.zeros_like(X_p)
+    for r in range(world_size):
+        W_in_r, W_out_r = broadcast_W_mlp_r(W_in_p, W_out_p, owner_rank=r)
+        hidden_pr = F.gelu(F.linear(X_p, W_in_r))
+        out += F.linear(hidden_pr, W_out_r)
+
+    return out
+
+
 def assert_tp_config(H: int, num_heads: int, world_size: int) -> None:
     if H % num_heads != 0:
         raise ValueError("H must be divisible by num_heads")
     if num_heads % world_size != 0:
         raise ValueError("num_heads must be divisible by world_size")
+
+
+def assert_mlp_tsp_config(intermediate_size: int, world_size: int) -> None:
+    if intermediate_size % world_size != 0:
+        raise ValueError("intermediate_size must be divisible by world_size")
+
+
+def assert_mlp_shapes(
+    H: int,
+    W_in_p: torch.Tensor,
+    W_out_p: torch.Tensor,
+) -> int:
+    p_I, H_in = W_in_p.shape
+    if H_in != H:
+        raise ValueError(f"expected W_in_p input size {H}, got {H_in}")
+    if W_out_p.shape != (H, p_I):
+        raise ValueError(
+            f"expected W_out_p shape {(H, p_I)}, got {tuple(W_out_p.shape)}"
+        )
+    return p_I
 
 
 def project_to_heads(
@@ -174,6 +231,15 @@ def attn(
     # attn: [B, num_heads, S, D]
     attn = attn.transpose(1, 2).contiguous().view(B, S, H)
     return F.linear(attn, W_o)
+
+
+def mlp(
+    X: torch.Tensor,
+    W_in: torch.Tensor,
+    W_out: torch.Tensor,
+) -> torch.Tensor:
+    hidden = F.gelu(F.linear(X, W_in))
+    return F.linear(hidden, W_out)
 
 
 def shard_col_parallel(
@@ -224,8 +290,8 @@ def init_tensor(shape: tuple[int, ...], device: torch.device) -> torch.Tensor:
 
 
 def run_tsp_attn(device: torch.device, rank: int, world_size: int, should_print: bool):
-    B = int(os.environ.get("BENCH_B", "1"))
-    S = int(os.environ.get("BENCH_S", "8192"))
+    B = int(os.environ.get("BENCH_B", "32"))
+    S = int(os.environ.get("BENCH_S", "65536"))
     H = int(os.environ.get("BENCH_H", "4096"))
     num_heads = int(os.environ.get("BENCH_NUM_HEADS", "32"))
     if H % num_heads != 0:
@@ -266,6 +332,9 @@ def run_tsp_attn(device: torch.device, rank: int, world_size: int, should_print:
 
     with torch.no_grad():
         expected = attn(X, W_q, W_k, W_v, W_o, num_heads)
+        _ = tsp_attn(X_p, W_q_p, W_k_p, W_v_p, W_o_p, num_heads)
+        torch.cuda.synchronize(device)
+
         with profile_rank_region("tsp_attention", device):
             out_p = tsp_attn(X_p, W_q_p, W_k_p, W_v_p, W_o_p, num_heads)
 
@@ -283,9 +352,91 @@ def run_tsp_attn(device: torch.device, rank: int, world_size: int, should_print:
     return out
 
 
+def shard_mlp_col_parallel(
+    W: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    I, _H = W.shape
+    assert_mlp_tsp_config(I, world_size)
+    p_I = I // world_size
+    start = rank * p_I
+    end = start + p_I
+    return W[start:end, :].contiguous()
+
+
+def shard_mlp_row_parallel(
+    W: torch.Tensor,
+    rank: int,
+    world_size: int,
+) -> torch.Tensor:
+    _H, I = W.shape
+    assert_mlp_tsp_config(I, world_size)
+    p_I = I // world_size
+    start = rank * p_I
+    end = start + p_I
+    return W[:, start:end].contiguous()
+
+
+def run_tsp_mlp(device: torch.device, rank: int, world_size: int, should_print: bool):
+    B = int(os.environ.get("BENCH_B", "32"))
+    S = int(os.environ.get("BENCH_S", "65536"))
+    H = int(os.environ.get("BENCH_H", "4096"))
+    I = int(os.environ.get("BENCH_I", "8192"))
+    assert_mlp_tsp_config(I, world_size)
+
+    if rank == 0:
+        torch.manual_seed(1234)
+        W_in = init_tensor((I, H), device)
+        W_out = init_tensor((H, I), device)
+
+        torch.manual_seed(5678)
+        X = torch.randn(B, S, H, device=device)
+    else:
+        W_in = torch.empty(I, H, device=device)
+        W_out = torch.empty(H, I, device=device)
+        X = torch.empty(B, S, H, device=device)
+
+    # W_in: [I, H]
+    # W_out: [H, I]
+    W_in = broadcast_from_rank0(W_in)
+    W_out = broadcast_from_rank0(W_out)
+    # X: [B, S, H]
+    X = broadcast_from_rank0(X)
+
+    # W_in_p: [p_I, H]
+    W_in_p = shard_mlp_col_parallel(W_in, rank, world_size)
+    # W_out_p: [H, p_I]
+    W_out_p = shard_mlp_row_parallel(W_out, rank, world_size)
+
+    X_p = shard_seq_parallel(X, rank, world_size)
+
+    with torch.no_grad():
+        expected = mlp(X, W_in, W_out)
+        _ = tsp_mlp(X_p, W_in_p, W_out_p)
+        torch.cuda.synchronize(device)
+
+        with profile_rank_region("tsp_mlp", device):
+            out_p = tsp_mlp(X_p, W_in_p, W_out_p)
+
+    expected_p = shard_seq_parallel(expected, rank, world_size)
+    torch.testing.assert_close(out_p, expected_p, rtol=1e-5, atol=1e-5)
+
+    gathered = [torch.empty_like(out_p) for _ in range(world_size)]
+    dist.all_gather(gathered, out_p)
+    out = torch.cat(gathered, dim=1)
+    torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    if should_print:
+        print("tensor-sequence-parallel MLP correctness check passed.")
+
+    return out_p
+
+
 def main():
     with distributed_context() as (rank, world_size, _LOCAL_RANK, device):
         run_tsp_attn(device, rank, world_size, should_print=rank == 0)
+        run_tsp_mlp(device, rank, world_size, should_print=rank == 0)
 
 
 if __name__ == "__main__":

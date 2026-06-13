@@ -268,43 +268,11 @@ def tp_mlp(
     return out
 
 
-def manual_attn(
-    X: torch.Tensor,
-    W_q: torch.Tensor,
-    W_k: torch.Tensor,
-    W_v: torch.Tensor,
-    W_o: torch.Tensor,
-    num_heads: int,
-) -> torch.Tensor:
-    B, S, H = X.shape
-    if H % num_heads != 0:
-        raise ValueError("hidden_size must be divisible by num_heads")
-    D = H // num_heads
-
-    q = project_to_heads(F.linear(X, W_q), num_heads, D)
-    k = project_to_heads(F.linear(X, W_k), num_heads, D)
-    v = project_to_heads(F.linear(X, W_v), num_heads, D)
-
-    # q: [B, num_heads, S, D]
-    # k: [B, num_heads, S, D]
-    # scores: [B, num_heads, S, S]
-    scale = D**-0.5
-    scores = q @ k.transpose(-2, -1) * scale
-    causal_mask = torch.ones(S, S, device=X.device, dtype=torch.bool).tril()
-    scores = scores.masked_fill(~causal_mask, float("-inf"))
-
-    # v: [B, num_heads, S, D]
-    # attn: [B, num_heads, S, D]
-    attn = torch.softmax(scores, dim=-1) @ v
-    attn = attn.transpose(1, 2).contiguous().view(B, S, H)
-    return F.linear(attn, W_o)
-
-
 def run_tp_attn(
     device: torch.device, rank: int, world_size: int, should_print: bool
 ) -> None:
-    B = int(os.environ.get("BENCH_B", "1"))
-    S = int(os.environ.get("BENCH_S", "8192"))
+    B = int(os.environ.get("BENCH_B", "32"))
+    S = int(os.environ.get("BENCH_S", "65536"))
     H = int(os.environ.get("BENCH_H", "4096"))
     num_heads = int(os.environ.get("BENCH_NUM_HEADS", "32"))
     assert_tp_config(H, num_heads, world_size)
@@ -344,6 +312,16 @@ def run_tp_attn(
 
     with torch.no_grad():
         expected = attn(X, W_q, W_k, W_v, W_o, num_heads)
+        tp_attn(
+            X,
+            W_q_p,
+            W_k_p,
+            W_v_p,
+            W_o_p,
+            p_heads,
+        )
+        torch.cuda.synchronize(device)
+
         with profile_rank_region("tp_attention", device):
             out = tp_attn(
                 X,
@@ -358,7 +336,7 @@ def run_tp_attn(
 
     gathered = [torch.empty_like(out) for _ in range(world_size)]
     dist.all_gather(gathered, out)
-    for other_rank, other_out in enumerate(gathered):
+    for other_out in gathered:
         torch.testing.assert_close(other_out, expected, rtol=1e-5, atol=1e-5)
         torch.testing.assert_close(other_out, out, rtol=1e-5, atol=1e-5)
 
@@ -401,9 +379,19 @@ def run_tp_mlp(
 
     with torch.no_grad():
         expected = mlp(X, W_in, W_out)
-        out = tp_mlp(X, W_in_p, W_out_p)
+        tp_mlp(X, W_in_p, W_out_p)
+        torch.cuda.synchronize(device)
+
+        with profile_rank_region("tp_mlp", device):
+            out = tp_mlp(X, W_in_p, W_out_p)
 
     torch.testing.assert_close(out, expected, rtol=1e-5, atol=1e-5)
+
+    gathered = [torch.empty_like(out) for _ in range(world_size)]
+    dist.all_gather(gathered, out)
+    for other_out in gathered:
+        torch.testing.assert_close(other_out, expected, rtol=1e-5, atol=1e-5)
+        torch.testing.assert_close(other_out, out, rtol=1e-5, atol=1e-5)
 
     if should_print:
         print("tensor-parallel MLP correctness check passed.")
